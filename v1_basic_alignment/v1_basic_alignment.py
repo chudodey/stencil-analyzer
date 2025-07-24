@@ -98,7 +98,7 @@ class CornerBasedMatcher:
         ]
 
     def extract_corner_features(self, image: np.ndarray, debug_mode: bool = False,
-                                debug_folder: str = None) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
+                                debug_folder: str = None, prefix: str = "") -> Tuple[List[cv2.KeyPoint], np.ndarray]:
         """Извлекает ORB-признаки из угловых зон."""
         corners = self.get_corner_regions(image.shape)
         all_keypoints = []
@@ -121,15 +121,11 @@ class CornerBasedMatcher:
 
             logging.info(f"Угол {i+1}: найдено {len(kp_corner)} признаков")
 
-        if debug_mode and debug_folder:
-            self._save_corner_debug(
-                image, corners, all_keypoints, debug_folder)
+            return all_keypoints, all_descriptors
 
-        return all_keypoints, all_descriptors
-
-    def _save_corner_debug(self, image: np.ndarray, corners: List[Tuple[int, int, int, int]],
-                           keypoints: List[cv2.KeyPoint], debug_folder: str) -> None:
-        """Сохраняет отладочную визуализацию угловых зон."""
+    def visualize_corners(self, image: np.ndarray, corners: List[Tuple[int, int, int, int]],
+                          keypoints: List[cv2.KeyPoint]) -> np.ndarray:
+        """Визуализирует угловые зоны и ключевые точки."""
         vis_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if len(
             image.shape) == 2 else image.copy()
         colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
@@ -141,10 +137,7 @@ class CornerBasedMatcher:
         if keypoints:
             vis_image = cv2.drawKeypoints(vis_image, keypoints, None, color=(0, 255, 255),
                                           flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-
-        debug_path = os.path.join(debug_folder, "corner_analysis.png")
-        cv2.imwrite(debug_path, vis_image)
-        logging.info(f"Сохранен отладочный файл: {debug_path}")
+        return vis_image
 
 
 class SimilarityTransformer:
@@ -272,33 +265,38 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
 
         # 1. Загрузка и предобработка
-        logging.info("Загрузка и предобработка изображений...")
+        logging.info("Шаг 1: Загрузка и предобработка изображений...")
         ref_gray, ref_binary = load_and_preprocess(args.ref)
         scan_gray, scan_binary = load_and_preprocess(args.scan)
 
         if args.debug:
-            save_debug_output(output_dir, "01_original_ref.png", ref_gray)
-            save_debug_output(output_dir, "01_original_scan.png", scan_gray)
             save_debug_output(
                 output_dir, "01_original_pair.png", ref_gray, scan_gray)
-            save_debug_output(output_dir, "02_binary_ref.png", ref_binary)
-            save_debug_output(output_dir, "02_binary_scan.png", scan_binary)
             save_debug_output(output_dir, "02_binary_pair.png",
                               ref_binary, scan_binary)
 
         # 2. Анализ угловых зон
-        logging.info("Анализ угловых зон...")
+        logging.info("Шаг 2: Анализ угловых зон...")
         matcher = CornerBasedMatcher(args.corner_size, args.min_matches)
-        ref_kp, ref_desc = matcher.extract_corner_features(
-            ref_binary, args.debug, output_dir)
-        scan_kp, scan_desc = matcher.extract_corner_features(
-            scan_binary, args.debug, output_dir)
+        ref_kp, ref_desc = matcher.extract_corner_features(ref_binary)
+        scan_kp, scan_desc = matcher.extract_corner_features(scan_binary)
+
+        if args.debug:
+            ref_corners = matcher.get_corner_regions(ref_binary.shape)
+            scan_corners = matcher.get_corner_regions(scan_binary.shape)
+
+            ref_vis = matcher.visualize_corners(
+                ref_binary, ref_corners, ref_kp)
+            scan_vis = matcher.visualize_corners(
+                scan_binary, scan_corners, scan_kp)
+            save_debug_output(
+                output_dir, "03_corner_analysis_pair.png", ref_vis, scan_vis)
 
         if ref_desc is None or scan_desc is None:
             raise ValueError("Не удалось извлечь признаки из угловых зон")
 
         # 3. Сопоставление признаков
-        logging.info("Сопоставление признаков...")
+        logging.info("Шаг 3: Сопоставление признаков...")
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         matches = bf.knnMatch(ref_desc, scan_desc, k=2)
         good_matches = [m for m, n in matches if len(
@@ -312,10 +310,11 @@ def main():
             matches_img = cv2.drawMatches(ref_gray, ref_kp, scan_gray, scan_kp,
                                           good_matches, None,
                                           flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-            save_debug_output(output_dir, "03_matches.png", matches_img)
+            save_debug_output(
+                output_dir, "04_feature_matches.png", matches_img)
 
         # 4. Вычисление трансформации
-        logging.info("Вычисление трансформации...")
+        logging.info("Шаг 4: Вычисление трансформации...")
         ref_pts = np.float32([ref_kp[m.queryIdx].pt for m in good_matches])
         scan_pts = np.float32([scan_kp[m.trainIdx].pt for m in good_matches])
 
@@ -330,7 +329,7 @@ def main():
             f"Параметры трансформации: масштаб={scale:.3f}, угол={angle:.2f}°, сдвиг=({tx:.1f}, {ty:.1f})")
 
         # 5. Применение трансформации
-        logging.info("Выравнивание изображения...")
+        logging.info("Шаг 5: Выравнивание изображения...")
         h, w = ref_gray.shape
         scan_aligned = cv2.warpAffine(scan_binary, M, (w, h),
                                       flags=cv2.INTER_LINEAR,
@@ -338,11 +337,11 @@ def main():
                                       borderValue=0)
 
         if args.debug:
-            save_debug_output(output_dir, "04_aligned.png",
+            save_debug_output(output_dir, "05_aligned_pair.png",
                               ref_binary, scan_aligned)
 
         # 6. Создание маски различий
-        logging.info("Генерация маски различий...")
+        logging.info("Шаг 6: Генерация маски различий...")
         diff_mask = create_difference_mask(ref_binary, scan_aligned)
         diff_pixels = np.count_nonzero(diff_mask)
         diff_percent = (diff_pixels / (h * w)) * 100
@@ -350,17 +349,13 @@ def main():
             f"Обнаружено различий: {diff_pixels} пикселей ({diff_percent:.2f}%)")
 
         # 7. Сохранение результатов
-        logging.info(f"Сохранение результата в {args.out}...")
+        logging.info("Шаг 7: Сохранение результатов...")
         cv2.imwrite(args.out, diff_mask)
 
         if args.debug:
-            # Для цветной визуализации различий
-            if len(scan_aligned.shape) == 2:
-                overlay = cv2.cvtColor(scan_aligned, cv2.COLOR_GRAY2BGR)
-            else:
-                overlay = scan_aligned.copy()
-            overlay[diff_mask > 0] = [0, 0, 255]  # Красный цвет для различий
-            save_debug_output(output_dir, "05_differences.png", overlay)
+            overlay = cv2.cvtColor(scan_aligned, cv2.COLOR_GRAY2BGR)
+            overlay[diff_mask > 0] = [0, 0, 255]
+            save_debug_output(output_dir, "06_differences.png", overlay)
 
         logging.info(
             f"✅ Успешно завершено за {time.time()-start_time:.2f} сек")
