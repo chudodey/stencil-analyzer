@@ -203,19 +203,56 @@ def create_difference_mask(ref_binary: np.ndarray, scan_aligned: np.ndarray,
     return diff_mask
 
 
+def align_images_height(images: List[np.ndarray]) -> List[np.ndarray]:
+    """Выравнивает изображения по высоте, добавляя черные полосы."""
+    if not images:
+        return []
+
+    # Определяем максимальную высоту
+    max_height = max(img.shape[0] for img in images)
+    aligned_images = []
+
+    for img in images:
+        # Конвертируем в BGR если нужно
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        h, w = img.shape[:2]
+        if h < max_height:
+            # Создаем черное изображение максимальной высоты
+            aligned = np.zeros((max_height, w, 3), dtype=np.uint8)
+            # Вычисляем отступ сверху
+            top = (max_height - h) // 2
+            # Вставляем оригинальное изображение
+            aligned[top:top+h, :] = img
+            aligned_images.append(aligned)
+        else:
+            aligned_images.append(img)
+
+    return aligned_images
+
+
 def save_debug_output(debug_folder: str, filename: str, *images: np.ndarray) -> None:
-    """Сохраняет отладочные изображения в output_imgs."""
+    """Сохраняет отладочные изображения в output_imgs с выравниванием по высоте."""
     if not os.path.exists(debug_folder):
         os.makedirs(debug_folder, exist_ok=True)
 
     path = os.path.join(debug_folder, filename)
     try:
-        if len(images) == 1:
-            cv2.imwrite(path, images[0])
+        if len(images) == 0:
+            return
+        elif len(images) == 1:
+            # Для одного изображения просто сохраняем
+            img = images[0]
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            cv2.imwrite(path, img)
         else:
-            # Объединение нескольких изображений по горизонтали
-            combined = np.hstack(images)
+            # Для нескольких изображений выравниваем высоту и объединяем
+            aligned = align_images_height(list(images))
+            combined = np.hstack(aligned)
             cv2.imwrite(path, combined)
+
         logging.info(f"Сохранен отладочный файл: {path}")
     except Exception as e:
         logging.warning(f"Ошибка сохранения {path}: {str(e)}")
@@ -240,9 +277,13 @@ def main():
         scan_gray, scan_binary = load_and_preprocess(args.scan)
 
         if args.debug:
-            save_debug_output(output_dir, "01_original.png",
-                              ref_gray, scan_gray)
-            save_debug_output(output_dir, "02_binary.png",
+            save_debug_output(output_dir, "01_original_ref.png", ref_gray)
+            save_debug_output(output_dir, "01_original_scan.png", scan_gray)
+            save_debug_output(
+                output_dir, "01_original_pair.png", ref_gray, scan_gray)
+            save_debug_output(output_dir, "02_binary_ref.png", ref_binary)
+            save_debug_output(output_dir, "02_binary_scan.png", scan_binary)
+            save_debug_output(output_dir, "02_binary_pair.png",
                               ref_binary, scan_binary)
 
         # 2. Анализ угловых зон
@@ -313,8 +354,12 @@ def main():
         cv2.imwrite(args.out, diff_mask)
 
         if args.debug:
-            overlay = cv2.cvtColor(scan_aligned, cv2.COLOR_GRAY2BGR)
-            overlay[diff_mask > 0] = [0, 0, 255]
+            # Для цветной визуализации различий
+            if len(scan_aligned.shape) == 2:
+                overlay = cv2.cvtColor(scan_aligned, cv2.COLOR_GRAY2BGR)
+            else:
+                overlay = scan_aligned.copy()
+            overlay[diff_mask > 0] = [0, 0, 255]  # Красный цвет для различий
             save_debug_output(output_dir, "05_differences.png", overlay)
 
         logging.info(
