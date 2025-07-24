@@ -26,7 +26,7 @@ import argparse
 import logging
 import os
 import sys
-from typing import Optional, Tuple, List, Any
+from typing import Tuple, List
 import time
 
 import cv2
