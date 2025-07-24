@@ -2,10 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Усовершенствованный конвейер для анализа трафаретов:
-1. Раздельная обработка эталона и скана
-2. Улучшенное выравнивание по центральной зоне
-3. Детекция дефектов с разделением на типы
-4. Профессиональная визуализация результатов
+Версия с интеллектуальной маскировкой для поиска центрального элемента в сетке.
 """
 
 import argparse
@@ -16,6 +13,8 @@ import os
 import cv2
 import numpy as np
 from typing import Tuple, Dict, Optional, List
+
+# ... (Код до StencilAligner остаётся без изменений) ...
 
 # Конфигурация логирования
 
@@ -129,36 +128,132 @@ class ContentCropper:
         p = self.padding
         return image[max(0, y-p):y+h+p, max(0, x-p):x+w+p]
 
-# Класс для точного выравнивания по центру
 
-
+# === КЛАСС STENCILALIGNER ПОЛНОСТЬЮ ПЕРЕРАБОТАН ===
 class StencilAligner:
-    def __init__(self, center_size: float = 0.5, min_matches: int = 15):
+    def __init__(self, center_size: float = 0.5, min_matches: int = 15, min_element_area: int = 1000):
         self.center_size = center_size
         self.min_matches = min_matches
-        self.orb = cv2.ORB_create(nfeatures=1500)
+        self.min_element_area = min_element_area
+        self.orb = cv2.ORB_create(
+            nfeatures=2000, scaleFactor=1.2, scoreType=cv2.ORB_FAST_SCORE)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    # Поместите эту обновлённую функцию в класс StencilAligner, заменив старую
+
+    # Поместите эту обновлённую функцию в класс StencilAligner, заменив предыдущую
+
+    # Поместите эту обновлённую функцию в класс StencilAligner, заменив предыдущую
+
+    def _get_centermost_element_mask(self, gray_image: np.ndarray, debug: bool = False, output_dir: str = "") -> Optional[np.ndarray]:
+        """Находит все элементы в центре, выбирает центральный и возвращает маску для него."""
+        h, w = gray_image.shape
+
+        # 1. Определяем центральную ROI
+        roi_w, roi_h = int(w * self.center_size), int(h * self.center_size)
+        roi_x, roi_y = (w - roi_w) // 2, (h - roi_h) // 2
+        central_roi = gray_image[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+
+        # 2. Адаптивная бинаризация для получения всех отдельных площадок
+        binary_roi = cv2.adaptiveThreshold(
+            central_roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, blockSize=51, C=7
+        )
+
+        # 3. Сильная дилатация, чтобы "склеить" площадки одной платы в единый blob
+        # Размер ядра должен быть достаточным, чтобы перекрыть зазоры внутри одной платы
+        # Примерно 10-15% от размера платы (270px) -> ~27px
+        dilation_kernel_size = 27
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (dilation_kernel_size, dilation_kernel_size))
+        dilated_roi = cv2.dilate(binary_roi, kernel, iterations=1)
+
+        if debug:
+            save_output_image(
+                dilated_roi, f"02a_dilated_roi_{'ref' if 'ref' in gray_image.sum().astype(str) else 'scan'}.png", output_dir, "Dilated ROI to find element groups")
+
+        # 4. Поиск контуров сгруппированных элементов ("клякс")
+        grouped_contours, _ = cv2.findContours(
+            dilated_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 5. Фильтрация контуров по площади
+        valid_contours = [cnt for cnt in grouped_contours if cv2.contourArea(
+            cnt) > self.min_element_area]
+        if not valid_contours:
+            logging.warning(
+                f"No element groups found with area > {self.min_element_area} px in the central zone.")
+            return None
+
+        # 6. Выбор самого центрального контура
+        roi_center_pt = (roi_w / 2, roi_h / 2)
+        min_dist = float('inf')
+        centermost_grouped_contour = None
+
+        for cnt in valid_contours:
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+            dist = np.sqrt(
+                (cx - roi_center_pt[0])**2 + (cy - roi_center_pt[1])**2)
+            if dist < min_dist:
+                min_dist = dist
+                centermost_grouped_contour = cnt
+
+        if centermost_grouped_contour is None:
+            return None
+
+        # 7. Создание финальной, точной маски
+        # Мы не используем размытый контур, а берем его Bounding Box
+        # и вырезаем им ОРИГИНАЛЬНЫЕ площадки из binary_roi
+        x, y, w_cnt, h_cnt = cv2.boundingRect(centermost_grouped_contour)
+
+        # Создаем пустую маску для ROI
+        final_roi_mask = np.zeros_like(binary_roi)
+        # Копируем в нее только те пиксели из оригинальной бинарной маски, что попали в BBox
+        final_roi_mask[y:y+h_cnt, x:x+w_cnt] = binary_roi[y:y+h_cnt, x:x+w_cnt]
+
+        # Переносим маску из ROI в глобальные координаты
+        final_mask = np.zeros_like(gray_image)
+        final_mask[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w] = final_roi_mask
+
+        return final_mask
 
     def align(self, ref_gray: np.ndarray, scan_gray: np.ndarray,
               debug: bool = False, output_dir: str = "") -> Tuple[np.ndarray, np.ndarray]:
-        if debug:
-            desc = f"Feature search zone ({self.center_size*100:.0f}% of center)"
-            self._visualize_search_zones(
-                ref_gray, "02_ref_search_zone.png", output_dir, desc)
-            self._visualize_search_zones(
-                scan_gray, "03_scan_search_zone.png", output_dir, desc)
 
-        ref_kp, ref_desc = self._extract_features(ref_gray)
-        scan_kp, scan_desc = self._extract_features(scan_gray)
+        logging.info("Creating masks for centermost elements...")
+        # Передаем debug и output_dir в функцию
+        ref_mask = self._get_centermost_element_mask(
+            ref_gray, debug, output_dir)
+        scan_mask = self._get_centermost_element_mask(
+            scan_gray, debug, output_dir)
+
+        if ref_mask is None or scan_mask is None:
+            raise AlignmentError(
+                "Could not isolate a central element for alignment. Try adjusting --center-size or --min-element-area.")
+
+        if debug:
+            self._visualize_search_mask(
+                ref_gray, ref_mask, "02_ref_search_mask.png", output_dir, "Reference Alignment Mask")
+            self._visualize_search_mask(
+                scan_gray, scan_mask, "03_scan_search_mask.png", output_dir, "Scan Alignment Mask")
+
+        # Ищем ключевые точки только в пределах масок
+        ref_kp, ref_desc = self.orb.detectAndCompute(ref_gray, mask=ref_mask)
+        scan_kp, scan_desc = self.orb.detectAndCompute(
+            scan_gray, mask=scan_mask)
 
         if debug:
             self._visualize_features(
-                ref_gray, ref_kp, "04_ref_features.png", output_dir, "ORB features in reference")
+                ref_gray, ref_kp, "04_ref_features.png", output_dir, "ORB features in reference mask")
             self._visualize_features(
-                scan_gray, scan_kp, "05_scan_features.png", output_dir, "ORB features in scan")
+                scan_gray, scan_kp, "05_scan_features.png", output_dir, "ORB features in scan mask")
 
-        if ref_desc is None or scan_desc is None:
-            raise AlignmentError("Not enough features for matching")
+        if ref_desc is None or scan_desc is None or len(ref_kp) < self.min_matches or len(scan_kp) < self.min_matches:
+            raise AlignmentError(
+                "Not enough features found in the masked areas for matching.")
 
         matches = self.bf.knnMatch(ref_desc, scan_desc, k=2)
         good = [m for m, n in matches if m.distance < 0.75 * n.distance]
@@ -175,7 +270,7 @@ class StencilAligner:
         pts_scan = np.float32([scan_kp[m.trainIdx].pt for m in good])
 
         M, _ = cv2.estimateAffinePartial2D(
-            pts_scan, pts_ref, method=cv2.RANSAC, ransacReprojThreshold=2.5)
+            pts_scan, pts_ref, method=cv2.RANSAC, ransacReprojThreshold=3.0, maxIters=2000)
         if M is None:
             raise AlignmentError("Affine transformation estimation failed")
 
@@ -183,38 +278,20 @@ class StencilAligner:
             scan_gray, M, (ref_gray.shape[1], ref_gray.shape[0]), flags=cv2.INTER_LINEAR)
         return M, aligned
 
-    def _extract_features(self, gray: np.ndarray) -> Tuple[List, Optional[np.ndarray]]:
-        regions = self._get_center_region(gray.shape)
-        kps, descs = [], None
-        for x, y, w, h in regions:
-            roi = gray[y:y+h, x:x+w]
-            kp, desc = self.orb.detectAndCompute(roi, None)
-            if kp and desc is not None:
-                for p in kp:
-                    p.pt = (p.pt[0] + x, p.pt[1] + y)
-                kps.extend(kp)
-                descs = np.vstack((descs, desc)) if descs is not None else desc
-        return kps, descs
-
-    def _get_center_region(self, shape: Tuple[int, int]) -> List[Tuple[int, int, int, int]]:
-        h, w = shape[:2]
-        center_w = int(w * self.center_size)
-        center_h = int(h * self.center_size)
-        offset_x = (w - center_w) // 2
-        offset_y = (h - center_h) // 2
-        return [(offset_x, offset_y, center_w, center_h)]
-
-    def _visualize_search_zones(self, gray: np.ndarray, filename: str, output_dir: str, description: str) -> None:
+    def _visualize_search_mask(self, gray: np.ndarray, mask: np.ndarray, filename: str, output_dir: str, description: str) -> None:
         img_color = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        regions = self._get_center_region(gray.shape)
-        for x, y, w, h in regions:
-            cv2.rectangle(img_color, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(img_color, description, (10,
-                    img_color.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        save_output_image(img_color, filename, output_dir, description)
+        # Накладываем маску с полупрозрачностью
+        overlay = img_color.copy()
+        overlay[mask > 0] = (0, 255, 0)  # Зеленая область для поиска
+        result = cv2.addWeighted(overlay, 0.4, img_color, 0.6, 0)
+
+        cv2.putText(result, description, (10,
+                    result.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        save_output_image(result, filename, output_dir, description)
 
     def _visualize_features(self, gray: np.ndarray, keypoints: List, filename: str, output_dir: str, description: str) -> None:
-        img_color = cv2.drawKeypoints(gray, keypoints, None, color=(
+        img_color = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        img_color = cv2.drawKeypoints(img_color, keypoints, None, color=(
             0, 0, 255), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         cv2.putText(img_color, f"Features: {len(keypoints)}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -231,9 +308,8 @@ class StencilAligner:
                     match_img.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         save_output_image(match_img, filename, output_dir, description)
 
-# Класс для детекции дефектов
 
-
+# ... (Классы DefectDetector и visualize_results остаются без изменений) ...
 class DefectDetector:
     def __init__(self, min_defect_area: int = 10, morph_size: int = 3):
         self.min_defect_area = min_defect_area
@@ -307,34 +383,44 @@ def visualize_results(ref: np.ndarray, scan: np.ndarray, M: np.ndarray, defects:
 
     return expanded_result
 
-# Главный конвейер обработки
-
 
 def main():
     start_time = time.time()
     parser = argparse.ArgumentParser(
-        description="Усовершенствованный анализ трафаретов")
+        description="Усовершенствованный анализ трафаретов с интеллектуальной маскировкой.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    # --- Основные параметры ---
     parser.add_argument("--ref", required=True, help="Эталонное изображение")
     parser.add_argument("--scan", required=True,
                         help="Сканируемое изображение")
     parser.add_argument("--out", default="result.png",
                         help="Имя выходного файла с результатом")
+
+    # --- Параметры обработки ---
     parser.add_argument("--padding", type=int, default=20,
-                        help="Отступ при обрезке")
-    parser.add_argument("--aggressive-clean",
-                        action="store_true", help="Агрессивная очистка скана")
-    parser.add_argument("--clahe-clip", type=float,
-                        default=3.0, help="Параметр CLAHE для скана")
+                        help="Отступ при обрезке содержимого")
+    parser.add_argument("--aggressive-clean", action="store_true",
+                        help="Агрессивная морфологическая очистка скана")
+
+    # --- Параметры выравнивания ---
     parser.add_argument("--center-size", type=float, default=0.5,
-                        help="Размер центральной зоны поиска (доля от 0.1 до 1.0)")
-    parser.add_argument("--min-matches", type=int, default=15,
-                        help="Минимальное количество совпадений")
-    parser.add_argument("--min-defect-area", type=int,
-                        default=10, help="Минимальная площадь дефекта")
+                        help="Размер центральной зоны для поиска элементов (доля от 0.1 до 1.0)")
+    parser.add_argument("--min-element-area", type=int, default=1000,
+                        help="Минимальная площадь элемента (платы) в пикселях для его учёта")
+    parser.add_argument("--min-matches", type=int, default=10,
+                        help="Минимальное количество совпадений для успешного выравнивания")
+
+    # --- Параметры детекции ---
+    parser.add_argument("--min-defect-area", type=int, default=10,
+                        help="Минимальная площадь дефекта в пикселях")
     parser.add_argument("--morph-size", type=int, default=3,
-                        help="Размер морфологического ядра")
+                        help="Размер морфологического ядра для очистки дефектов")
+
+    # --- Отладка ---
     parser.add_argument("--debug", action="store_true",
                         help="Режим отладки с сохранением промежуточных изображений")
+
     args = parser.parse_args()
 
     configure_logging(args.debug)
@@ -353,10 +439,9 @@ def main():
             raise ValueError(f"Failed to load scan image: {args.scan}")
 
         logging.info("Stage 1: Content cropping...")
-        cropper = ContentCropper(
-            args.padding, args.aggressive_clean, args.clahe_clip)
+        cropper = ContentCropper(args.padding, args.aggressive_clean)
         ref_cropped = cropper.process_ref(ref_img)
-        scan_cropped, scan_binary = cropper.process_scan(scan_img)
+        scan_cropped, _ = cropper.process_scan(scan_img)
         if args.debug:
             save_output_image(ref_cropped, "01_ref_cropped.png",
                               output_dir, "Reference after cropping")
@@ -365,14 +450,13 @@ def main():
 
         ref_gray = cv2.cvtColor(ref_cropped, cv2.COLOR_BGR2GRAY)
         scan_gray = cv2.cvtColor(scan_cropped, cv2.COLOR_BGR2GRAY)
-        if args.debug:
-            save_output_pair(ref_gray, scan_gray, "01_gray_pair.png", output_dir,
-                             "Ref Gray", "Scan Gray", "Grayscale images before alignment")
 
         logging.info("Stage 2: Alignment...")
-        aligner = StencilAligner(args.center_size, args.min_matches)
+        aligner = StencilAligner(
+            args.center_size, args.min_matches, args.min_element_area)
         M, aligned_scan_gray = aligner.align(
             ref_gray, scan_gray, args.debug, output_dir)
+
         if args.debug:
             save_output_pair(ref_gray, aligned_scan_gray, "06_aligned_gray.png",
                              output_dir, "Ref Gray", "Aligned Scan", "Images after alignment")
