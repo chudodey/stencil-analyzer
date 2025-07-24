@@ -1,0 +1,24 @@
+Структура папок тома DATA
+Серийный номер тома: 3C7C-6F9B
+D:\YANDEXDISK\_DALER ARTS\JB-250605 СКРИПТ\CODE2
+|   directory_tree.txt
+|   make_tree.bat
+|   
++---v1_basic_alignment
+|   |   ref.png
+|   |   scan.jpg
+|   |   v1_basic_alignment.py
+|   |   
+|   \---output_imgs
++---v2_smart_cropping
+|   |   ref.png
+|   |   scan.jpg
+|   |   v2_smart_cropping.py
+|   |   
+|   \---output_imgs
+\---v3_unified_pipeline
+    |   ref.png
+    |   scan.jpg
+    |   v3_unified_pipeline.py
+    |   
+    \---output_imgs
